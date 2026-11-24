@@ -5,6 +5,9 @@ on:
   push:
     branches: [ main ]
 
+permissions:
+  contents: write
+
 jobs:
   ipa:
     runs-on: macos-15
@@ -53,19 +56,41 @@ jobs:
             -derivedDataPath build 2>&1 | tail -300
 
       - name: Package IPA
+        id: pack
         run: |
           cd src
           VERSION=$(sed -n 's/.*MARKETING_VERSION: *//p' project.yml | head -1 | tr -d '" ')
-          echo "VERSION=$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           APP=build/Build/Products/Release-iphoneos/DouDuo.app
           ls -d "$APP"
+          echo "--- MinimumOSVersion ---"
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          echo "--- bundle id ---"
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
           rm -rf build/ipa && mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
           cd build/ipa && zip -qry "../DouDuo-${VERSION}-topbarfix-unsigned.ipa" Payload
           cd ../..
           ls -lh build/*.ipa
           shasum -a 256 build/*.ipa | tee build/SHA256.txt
+          echo "ipa=build/DouDuo-${VERSION}-topbarfix-unsigned.ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Release with IPA
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v1.3.14-topbarfix-${{ github.run_number }}
+          name: DouDuo 1.3.14 + 顶栏修复（非 Duo 机型 / iOS 17.0）
+          body: |
+            基于官方 v1.3.14（build 92，MinimumOSVersion 17.0），应用了顶栏适配补丁。
+
+            - 顶栏不再被推进状态栏/灵动岛，iPhone 15 Pro 竖屏文字顶边 65pt、横屏 14pt
+            - 倍速角标跟着下移，不再和顶栏重叠
+            - Duo 真机保持原逻辑（0 / -80），无变化
+
+            未签名 IPA，需自备证书签名安装。
+          files: |
+            src/build/*.ipa
+            src/build/SHA256.txt
 
       - uses: actions/upload-artifact@v4
         with:
