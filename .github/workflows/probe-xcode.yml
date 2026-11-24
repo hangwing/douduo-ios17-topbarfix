@@ -1,0 +1,29 @@
+name: probe-xcode
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26, macos-27, macos-26-xlarge]
+    runs-on: ${{ matrix.os }}
+    continue-on-error: true
+    steps:
+      - name: List Xcodes and SDKs
+        shell: bash
+        run: |
+          echo "=== runner: ${{ matrix.os }} ==="
+          sw_vers
+          echo "--- /Applications/Xcode*.app ---"
+          ls -d /Applications/Xcode*.app 2>/dev/null || echo none
+          echo "--- each xcode ---"
+          for X in /Applications/Xcode*.app; do
+            [ -d "$X" ] || continue
+            echo "### $X"
+            "$X/Contents/Developer/usr/bin/xcodebuild" -version 2>/dev/null | head -2
+            SDKROOT="$X/Contents/Developer/Platforms/iPhoneOS.platform/Developer/SDKs"
+            ls "$SDKROOT" 2>/dev/null | tr '\n' ' '; echo
+          done
