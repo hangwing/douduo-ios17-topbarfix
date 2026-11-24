@@ -1,0 +1,102 @@
+--- a/DouDuo/DouyinDuoLayout.swift
++++ b/DouDuo/DouyinDuoLayout.swift
+@@ -2,6 +2,7 @@
+ // iOS 27.1 用 ArrangementView.overlay（书本：视频 leading、评论 trailing；桌面：视频在上、评论在下）。
+ // 更低版本回退容器宽度 wide>=700，不读方向、不读 UIScreen。
+ import SwiftUI
++import UIKit
+ 
+ enum DYDuoMetrics {
+     /// Align full-bleed video chrome to the runtime trailing system column.
+@@ -15,6 +16,31 @@
+ 
+     /// iOS 17–27.0 的宽屏回退，和改版前同一条线。
+     static let legacyWideMin: CGFloat = 700
++
++    /// 是不是 iPhone Duo 真机（iPhone19,4）。
++    /// 顶栏那套「整层忽略安全区 + 上推 80」只对 Duo 外屏成立：Duo 外屏窗口内容区比物理屏顶低约 80pt，
++    /// 推 80 正好贴顶。普通 iPhone（15 Pro 等）窗口从物理顶端开始，再推 80 就把「关注/推荐/直播」
++    /// 推进状态栏和灵动岛里，点不到。上游 issue #16，1.3.15 修了但最低系统提到 26.0。
++    static let isDuoHardware: Bool = {
++        #if targetEnvironment(simulator)
++        let id = ProcessInfo.processInfo.environment["SIMULATOR_MODEL_IDENTIFIER"] ?? ""
++        #else
++        var s = utsname()
++        uname(&s)
++        let id = withUnsafeBytes(of: &s.machine) { raw in
++            String(decoding: raw.prefix { $0 != 0 }, as: UTF8.self)
++        }
++        #endif
++        return id == "iPhone19,4"
++    }()
++
++    /// 窗口顶部安全区（状态栏 / 灵动岛）。这一层整块 ignoresSafeArea，GeometryProxy 量到的 top 恒为 0，
++    /// 只能直接读 keyWindow。横屏状态栏隐藏时返回 0。
++    @MainActor static var windowSafeTop: CGFloat {
++        UIApplication.shared.connectedScenes
++            .compactMap { ($0 as? UIWindowScene)?.keyWindow }
++            .first?.safeAreaInsets.top ?? 0
++    }
+ 
+     /// 折痕是否处于激活状态（半折叠）。iOS 27.1 以下恒为 false。
+     static func foldIsActive(_ proxy: GeometryProxy) -> Bool {
+--- a/DouDuo/DouyinFeedView.swift
++++ b/DouDuo/DouyinFeedView.swift
+@@ -1230,6 +1230,21 @@
+     private var chromeMode: DDChromeMode { DDChromeMode(rawValue: chromeModeRaw) ?? .classic }
+     /// 半折叠/合屏：顶栏要整体左移躲开前摄挖孔，间距也收紧（默认模式用）
+     @State private var topNudge: CGFloat = 0
++    /// 默认模式顶栏的整体垂直偏移。这一层已 ignoresSafeArea（原点 = 物理屏顶），
++    /// 而 topBar 自己还带内边距（compact 76pt / regular 23pt），所以把内边距扣掉，
++    /// 让算的是「关注/推荐/直播」这几个字的顶边落点。
++    ///
++    /// - iPhone Duo：内屏 0（与系统时间同行）、外屏 -80（外屏窗口比物理顶低 80pt）→ 原样保留
++    /// - 其他 iPhone / iPad：竖屏落在安全区下沿 +6pt；横屏状态栏隐藏（safeTop=0）落在离顶 14pt
++    /// 15 Pro 代入：竖屏 59+6−76 = −11 → 文字顶边 65pt（灵动岛下沿 48）；
++    ///              横屏 14−76 = −62 → 文字顶边 14pt（原来 −4，出屏）
++    @MainActor private var topBarTopPadding: CGFloat {
++        if DYDuoMetrics.isDuoHardware { return hSize == .regular ? 0 : -80 }
++        let inner: CGFloat = hSize == .regular ? 23 : 76
++        let safeTop = DYDuoMetrics.windowSafeTop
++        let target: CGFloat = safeTop < 1 ? 14 : safeTop + 6
++        return target - inner
++    }
+     /// 顶栏可用宽度：评论栏从右侧滑出时 = 视频区宽度，顶栏跟着视频居中、自适应收紧（默认模式用）
+     @State private var topBarWidth: CGFloat?
+     @State private var topChrome = CGRect.zero
+@@ -1258,7 +1273,7 @@
+                 VStack(spacing: 6) {
+                     topBar
+                 }
+-                .padding(.top, hSize == .regular ? 0 : -80)
++                .padding(.top, topBarTopPadding)
+                 // 评论栏展开：顶栏只占视频那一块，跟着视频缩到左边。直播预览仍量这块的下沿。
+                 .frame(width: topBarWidth)
+                 .frame(maxWidth: .infinity, alignment: .leading)
+--- a/DouDuo/ShortVideoPlayer.swift
++++ b/DouDuo/ShortVideoPlayer.swift
+@@ -394,7 +394,8 @@
+                 .padding(.horizontal, 9).padding(.vertical, 5)
+                 .background(Capsule().fill(.black.opacity(0.45)))
+                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+-                .padding(.leading, 14).padding(.top, 66 * ui)
++                .padding(.leading, 14)
++                .padding(.top, rateBadgeTop)
+                 .allowsHitTesting(false)
+             }
+         }
+@@ -574,6 +575,14 @@
+         .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+         .environment(\.colorScheme, .dark)
+         .allowsHitTesting(false)
++    }
++
++    /// 倍速角标离屏顶的距离。
++    /// Duo 外屏状态区约 85pt，66 * ui 正好落在顶栏下方；其他机型（15 Pro 等）顶栏被挪到安全区下沿，
++    /// 角标必须跟着走，否则会跟顶栏叠在一起。
++    @MainActor private var rateBadgeTop: CGFloat {
++        if DYDuoMetrics.isDuoHardware { return 66 * ui }
++        return max(DYDuoMetrics.windowSafeTop, 12) + 56
+     }
+ 
+     private var progressBar: some View {
