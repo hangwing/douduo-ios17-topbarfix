@@ -10,21 +10,39 @@ permissions:
 
 jobs:
   ipa:
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - name: Checkout harness
         uses: actions/checkout@v4
 
-      - name: Clone upstream DouDuo v1.3.14
+      - name: Select newest Xcode available
+        shell: bash
         run: |
+          set -euo pipefail
+          ls -d /Applications/Xcode*.app || true
+          xcode-select -p || true
+          # 选版本号最大的那个 Xcode
+          BEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
+          echo "selected: $BEST"
+          sudo xcode-select -s "$BEST/Contents/Developer"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: Clone upstream DouDuo v1.3.14
+        shell: bash
+        run: |
+          set -euo pipefail
           git clone --depth 1 --branch v1.3.14 https://github.com/81199000/DouDuo.git src
           cd src && git log --oneline -1
 
       - name: Apply top bar fix for non-Duo iPhones
+        shell: bash
         run: |
+          set -euo pipefail
           cd src
           patch -p1 < ../fix-topbar-non-duo-iphone.patch
-          grep -n 'topBarTopPadding\|rateBadgeTop' DouDuo/DouyinFeedView.swift DouDuo/ShortVideoPlayer.swift
+          grep -n 'topBarTopPadding' DouDuo/DouyinFeedView.swift
+          grep -n 'rateBadgeTop' DouDuo/ShortVideoPlayer.swift
           grep -n 'isDuoHardware\|windowSafeTop' DouDuo/DouyinDuoLayout.swift
 
       - name: Cache VLCKit
@@ -32,48 +50,78 @@ jobs:
         id: vlckit
         with:
           path: src/Vendor/VLCKit/VLCKit-all.xcframework
-          key: vlckit-3.6.0
+          key: vlckit-3.6.0-asset
 
       - name: Fetch VLCKit (780MB, first run only)
         if: steps.vlckit.outputs.cache-hit != 'true'
+        shell: bash
         run: |
+          set -euo pipefail
           cd src
           sh scripts/fetch-vlckit.sh
+          du -sh Vendor/VLCKit/VLCKit-all.xcframework
 
       - name: Install xcodegen
         run: brew install xcodegen
 
       - name: Generate project
-        run: cd src && xcodegen generate
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd src
+          xcodegen generate
+          grep -n 'MARKETING_VERSION\|IPHONEOS_DEPLOYMENT_TARGET' DouDuo.xcodeproj/project.pbxproj | head -5
 
       - name: Build unsigned Release
+        shell: bash
         run: |
+          set -euo pipefail
           cd src
+          set +e
           xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release \
             -sdk iphoneos -destination 'generic/platform=iOS' \
             CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
             ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
-            -derivedDataPath build 2>&1 | tail -300
+            -derivedDataPath build > build.log 2>&1
+          STATUS=$?
+          set -e
+          echo "xcodebuild exit=$STATUS"
+          tail -120 build.log
+          # 把完整日志发到 job summary，方便在网页上看
+          {
+            echo '## xcodebuild log (tail 3000 lines)'
+            echo '```'
+            tail -3000 build.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::error::xcodebuild failed with exit code $STATUS"
+            exit "$STATUS"
+          fi
 
       - name: Package IPA
         id: pack
+        shell: bash
         run: |
+          set -euo pipefail
           cd src
           VERSION=$(sed -n 's/.*MARKETING_VERSION: *//p' project.yml | head -1 | tr -d '" ')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           APP=build/Build/Products/Release-iphoneos/DouDuo.app
-          ls -d "$APP"
-          echo "--- MinimumOSVersion ---"
-          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
-          echo "--- bundle id ---"
+          echo "app dir: $APP"
+          ls -la "$APP"
+          # 主程序必须在，否则这个包是废的
+          test -f "$APP/DouDuo" || { echo "::error::DouDuo executable missing in app bundle"; exit 1; }
+          file "$APP/DouDuo"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           rm -rf build/ipa && mkdir -p build/ipa/Payload
           cp -R "$APP" build/ipa/Payload/
           cd build/ipa && zip -qry "../DouDuo-${VERSION}-topbarfix-unsigned.ipa" Payload
           cd ../..
           ls -lh build/*.ipa
+          unzip -l "build/DouDuo-${VERSION}-topbarfix-unsigned.ipa" | grep -E 'Payload/DouDuo.app/DouDuo$' || { echo "::error::IPA missing main binary"; exit 1; }
           shasum -a 256 build/*.ipa | tee build/SHA256.txt
-          echo "ipa=build/DouDuo-${VERSION}-topbarfix-unsigned.ipa" >> "$GITHUB_OUTPUT"
 
       - name: Publish Release with IPA
         uses: softprops/action-gh-release@v2
@@ -83,19 +131,30 @@ jobs:
           body: |
             基于官方 v1.3.14（build 92，MinimumOSVersion 17.0），应用了顶栏适配补丁。
 
-            - 顶栏不再被推进状态栏/灵动岛，iPhone 15 Pro 竖屏文字顶边 65pt、横屏 14pt
+            - 顶栏不再被推进状态栏/灵动岛
             - 倍速角标跟着下移，不再和顶栏重叠
-            - Duo 真机保持原逻辑（0 / -80），无变化
+            - Duo 真机保持原逻辑，无变化
 
             未签名 IPA，需自备证书签名安装。
           files: |
             src/build/*.ipa
             src/build/SHA256.txt
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload build log on failure
+        if: failure()
+        uses: softprops/action-gh-release@v2
         with:
-          name: DouDuo-1.3.14-topbarfix-unsigned-ipa
+          tag_name: buildlog-latest
+          name: build log
+          body: xcodebuild 失败日志
+          files: src/build.log
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: build-output
           path: |
             src/build/*.ipa
             src/build/SHA256.txt
-          retention-days: 30
+            src/build.log
+          retention-days: 14
