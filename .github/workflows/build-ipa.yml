@@ -15,13 +15,10 @@ jobs:
       - name: Checkout harness
         uses: actions/checkout@v4
 
-      - name: Select newest Xcode available
+      - name: Select newest Xcode (26.6 = iPhoneOS 26.5 SDK)
         shell: bash
         run: |
           set -euo pipefail
-          ls -d /Applications/Xcode*.app || true
-          xcode-select -p || true
-          # 选版本号最大的那个 Xcode
           BEST=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -1)
           echo "selected: $BEST"
           sudo xcode-select -s "$BEST/Contents/Developer"
@@ -35,15 +32,23 @@ jobs:
           git clone --depth 1 --branch v1.3.14 https://github.com/81199000/DouDuo.git src
           cd src && git log --oneline -1
 
-      - name: Apply top bar fix for non-Duo iPhones
+      - name: Apply patches (top bar fix + SDK 26 compatibility)
         shell: bash
         run: |
           set -euo pipefail
-          cd src
-          patch -p1 < ../fix-topbar-non-duo-iphone.patch
-          grep -n 'topBarTopPadding' DouDuo/DouyinFeedView.swift
-          grep -n 'rateBadgeTop' DouDuo/ShortVideoPlayer.swift
-          grep -n 'isDuoHardware\|windowSafeTop' DouDuo/DouyinDuoLayout.swift
+          python3 apply_fix.py src
+          echo "--- verify ---"
+          grep -n 'topBarTopPadding' src/DouDuo/DouyinFeedView.swift
+          grep -n 'rateBadgeTop' src/DouDuo/ShortVideoPlayer.swift
+          grep -n 'isDuoHardware\|windowSafeTop' src/DouDuo/DouyinDuoLayout.swift
+          echo "--- no SDK27 leftovers expected ---"
+          if grep -rn 'reservedRegions(' src/DouDuo/ | grep -v '^[^:]*: *//'; then
+            echo "::error::reservedRegions still present"; exit 1
+          fi
+          if grep -rn 'DeviceHinge\|ArrangementView {' src/DouDuo/*.swift | grep -v '//'; then
+            echo "::error::SDK27 API still present"; exit 1
+          fi
+          echo OK
 
       - name: Cache VLCKit
         uses: actions/cache@v4
@@ -70,7 +75,6 @@ jobs:
           set -euo pipefail
           cd src
           xcodegen generate
-          grep -n 'MARKETING_VERSION\|IPHONEOS_DEPLOYMENT_TARGET' DouDuo.xcodeproj/project.pbxproj | head -5
 
       - name: Build unsigned Release
         shell: bash
@@ -86,12 +90,18 @@ jobs:
           STATUS=$?
           set -e
           echo "xcodebuild exit=$STATUS"
-          tail -120 build.log
-          # 把完整日志发到 job summary，方便在网页上看
+          echo "--- errors ---"
+          grep -E 'error:' build.log | sed 's|.*/src/||' | sort -u | head -40 || true
+          echo "--- tail ---"
+          tail -60 build.log
           {
-            echo '## xcodebuild log (tail 3000 lines)'
+            echo '## xcodebuild errors'
             echo '```'
-            tail -3000 build.log
+            grep -E 'error:' build.log | sed 's|.*/src/||' | sort -u | head -200 || true
+            echo '```'
+            echo '## tail 4000'
+            echo '```'
+            tail -4000 build.log
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           if [ "$STATUS" -ne 0 ]; then
@@ -109,8 +119,7 @@ jobs:
           APP=build/Build/Products/Release-iphoneos/DouDuo.app
           echo "app dir: $APP"
           ls -la "$APP"
-          # 主程序必须在，否则这个包是废的
-          test -f "$APP/DouDuo" || { echo "::error::DouDuo executable missing in app bundle"; exit 1; }
+          test -f "$APP/DouDuo" || { echo "::error::main binary missing"; exit 1; }
           file "$APP/DouDuo"
           /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
@@ -120,7 +129,8 @@ jobs:
           cd build/ipa && zip -qry "../DouDuo-${VERSION}-topbarfix-unsigned.ipa" Payload
           cd ../..
           ls -lh build/*.ipa
-          unzip -l "build/DouDuo-${VERSION}-topbarfix-unsigned.ipa" | grep -E 'Payload/DouDuo.app/DouDuo$' || { echo "::error::IPA missing main binary"; exit 1; }
+          unzip -l "build/DouDuo-${VERSION}-topbarfix-unsigned.ipa" | grep 'Payload/DouDuo.app/DouDuo$' \
+            || { echo "::error::IPA missing main binary"; exit 1; }
           shasum -a 256 build/*.ipa | tee build/SHA256.txt
 
       - name: Publish Release with IPA
@@ -129,28 +139,21 @@ jobs:
           tag_name: v1.3.14-topbarfix-${{ github.run_number }}
           name: DouDuo 1.3.14 + 顶栏修复（非 Duo 机型 / iOS 17.0）
           body: |
-            基于官方 v1.3.14（build 92，MinimumOSVersion 17.0），应用了顶栏适配补丁。
+            基于官方 v1.3.14（build 92，MinimumOSVersion 17.0）。
 
-            - 顶栏不再被推进状态栏/灵动岛
+            - 顶栏不再被推进状态栏/灵动岛（iPhone 15 Pro 竖屏文字顶边 65pt、横屏 14pt）
             - 倍速角标跟着下移，不再和顶栏重叠
-            - Duo 真机保持原逻辑，无变化
+            - Duo 真机保持原逻辑（0 / -80），无变化
+            - 裁掉上游依赖 iOS 27 SDK 的代码分支（iOS 17.0 上本来就不执行）
 
             未签名 IPA，需自备证书签名安装。
           files: |
             src/build/*.ipa
             src/build/SHA256.txt
 
-      - name: Upload build log on failure
-        if: failure()
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: buildlog-latest
-          name: build log
-          body: xcodebuild 失败日志
-          files: src/build.log
-
-      - uses: actions/upload-artifact@v4
+      - name: Upload artifacts
         if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: build-output
           path: |
