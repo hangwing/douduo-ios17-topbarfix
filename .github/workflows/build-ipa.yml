@@ -1,0 +1,76 @@
+name: build-ipa
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  ipa:
+    runs-on: macos-15
+    steps:
+      - name: Checkout harness
+        uses: actions/checkout@v4
+
+      - name: Clone upstream DouDuo v1.3.14
+        run: |
+          git clone --depth 1 --branch v1.3.14 https://github.com/81199000/DouDuo.git src
+          cd src && git log --oneline -1
+
+      - name: Apply top bar fix for non-Duo iPhones
+        run: |
+          cd src
+          patch -p1 < ../fix-topbar-non-duo-iphone.patch
+          grep -n 'topBarTopPadding\|rateBadgeTop' DouDuo/DouyinFeedView.swift DouDuo/ShortVideoPlayer.swift
+          grep -n 'isDuoHardware\|windowSafeTop' DouDuo/DouyinDuoLayout.swift
+
+      - name: Cache VLCKit
+        uses: actions/cache@v4
+        id: vlckit
+        with:
+          path: src/Vendor/VLCKit/VLCKit-all.xcframework
+          key: vlckit-3.6.0
+
+      - name: Fetch VLCKit (780MB, first run only)
+        if: steps.vlckit.outputs.cache-hit != 'true'
+        run: |
+          cd src
+          sh scripts/fetch-vlckit.sh
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate project
+        run: cd src && xcodegen generate
+
+      - name: Build unsigned Release
+        run: |
+          cd src
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' \
+            CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            -derivedDataPath build 2>&1 | tail -300
+
+      - name: Package IPA
+        run: |
+          cd src
+          VERSION=$(sed -n 's/.*MARKETING_VERSION: *//p' project.yml | head -1 | tr -d '" ')
+          echo "VERSION=$VERSION"
+          APP=build/Build/Products/Release-iphoneos/DouDuo.app
+          ls -d "$APP"
+          /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+          rm -rf build/ipa && mkdir -p build/ipa/Payload
+          cp -R "$APP" build/ipa/Payload/
+          cd build/ipa && zip -qry "../DouDuo-${VERSION}-topbarfix-unsigned.ipa" Payload
+          cd ../..
+          ls -lh build/*.ipa
+          shasum -a 256 build/*.ipa | tee build/SHA256.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-1.3.14-topbarfix-unsigned-ipa
+          path: |
+            src/build/*.ipa
+            src/build/SHA256.txt
+          retention-days: 30
